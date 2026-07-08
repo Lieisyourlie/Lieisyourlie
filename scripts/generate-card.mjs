@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Generates vibe-usage-card.svg — a full 7-day dashboard replica of vibecafe.ai/usage.
-// Data: GET /api/usage?days=14 (last 7 days + previous 7 for deltas).
+// Generates vibe-usage-card.svg — a full 30-day dashboard replica of vibecafe.ai/usage.
+// Data: GET /api/usage?days=60 (last 30 days + previous 30 for deltas).
 // API key: env VIBE_USAGE_API_KEY, or local ~/.vibe-usage/config.json.
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 const TZ_OFFSET_H = 8; // UTC+8 for day/hour grouping
+const WINDOW = 30;     // days shown in the dashboard
 
 function getApiKey() {
   if (process.env.VIBE_USAGE_API_KEY) return process.env.VIBE_USAGE_API_KEY;
@@ -16,18 +17,18 @@ function getApiKey() {
   throw new Error('No API key: set VIBE_USAGE_API_KEY or run vibe-usage init');
 }
 
-const res = await fetch('https://vibecafe.ai/api/usage?days=14', {
+const res = await fetch(`https://vibecafe.ai/api/usage?days=${WINDOW * 2}`, {
   headers: { Authorization: `Bearer ${getApiKey()}` },
 });
 if (!res.ok) throw new Error(`HTTP ${res.status}`);
 const { buckets = [], sessions = [] } = await res.json();
 
-// ---- split into current 7 days vs previous 7 days (UTC+8 calendar days) ----
+// ---- split into current WINDOW days vs previous WINDOW days (UTC+8 calendar days) ----
 const DAY = 86400_000;
 const nowLocal = Date.now() + TZ_OFFSET_H * 3600_000;
-const todayStart = Math.floor(nowLocal / DAY) * DAY; // start of today, local
-const curFrom = todayStart - 6 * DAY;                // 7-day window incl. today
-const prevFrom = curFrom - 7 * DAY;
+const todayStart = Math.floor(nowLocal / DAY) * DAY;   // start of today, local
+const curFrom = todayStart - (WINDOW - 1) * DAY;       // WINDOW-day window incl. today
+const prevFrom = curFrom - WINDOW * DAY;
 
 const localMs = (iso) => new Date(iso).getTime() + TZ_OFFSET_H * 3600_000;
 
@@ -51,7 +52,7 @@ function stats(bs, ss) {
   return s;
 }
 
-const inWin = (t, from) => t >= from && t < from + 7 * DAY;
+const inWin = (t, from) => t >= from && t < from + WINDOW * DAY;
 const curB = buckets.filter(b => inWin(localMs(b.bucketStart), curFrom));
 const prevB = buckets.filter(b => inWin(localMs(b.bucketStart), prevFrom));
 const curS = sessions.filter(s => inWin(localMs(s.firstMessageAt), curFrom));
@@ -61,14 +62,14 @@ const prev = stats(prevB, prevS);
 
 // ---- daily trend: output/input/cached tokens per local day ----
 const days = [];
-for (let i = 0; i < 7; i++) {
+for (let i = 0; i < WINDOW; i++) {
   const from = curFrom + i * DAY;
   const d = new Date(from);
   days.push({ label: `${d.getUTCMonth() + 1}/${d.getUTCDate()}`, output: 0, input: 0, cached: 0, total: 0 });
 }
 for (const b of curB) {
   const i = Math.floor((localMs(b.bucketStart) - curFrom) / DAY);
-  if (i >= 0 && i < 7) {
+  if (i >= 0 && i < WINDOW) {
     days[i].output += +b.outputTokens || 0;
     days[i].input += +b.inputTokens || 0;
     days[i].cached += +b.cachedInputTokens || 0;
@@ -151,7 +152,7 @@ function pillRow() {
   out += `<rect x="${x}" y="14" width="248" height="26" rx="13" fill="#111113" stroke="#232326"/>`;
   for (const it of items) {
     const w = it.length * 12 + 16;
-    const active = it === '7D';
+    const active = it === '30D';
     if (active) out += `<rect x="${x + 5}" y="17" width="${w}" height="20" rx="10" fill="#fafafa"/>`;
     out += `<text x="${x + 5 + w / 2}" y="31" font-size="11" text-anchor="middle" fill="${active ? '#09090b' : '#a1a1aa'}">${it}</text>`;
     x += w + 4;
@@ -171,13 +172,19 @@ function trendPanel(x, y) {
   const w = PANEL_W, h = panelH;
   const chartX = x + 52, chartY = y + 64, chartW = w - 72, chartH = h - 110;
   const maxV = Math.max(1, ...days.map(d => d.total));
-  const barW = Math.min(46, chartW / 7 * 0.62);
+  const n = days.length;
+  const slot = chartW / n;
+  const barW = Math.max(3, Math.min(46, slot * 0.66));
+  const barRx = barW > 6 ? 3 : 1.5;
+  const labelEvery = n > 12 ? 5 : 1; // sparse labels for 30-day view
   let bars = '', labels = '';
   days.forEach((d, i) => {
-    const cx = chartX + chartW / 7 * (i + 0.5);
+    const cx = chartX + slot * (i + 0.5);
     const bh = Math.max(2, d.total / maxV * chartH);
-    bars += `<rect x="${cx - barW / 2}" y="${chartY + chartH - bh}" width="${barW}" height="${bh}" rx="4" fill="url(#barGrad)"/>`;
-    labels += `<text x="${cx}" y="${y + h - 18}" font-size="11" fill="#71717a" text-anchor="middle">${d.label}</text>`;
+    bars += `<rect x="${cx - barW / 2}" y="${chartY + chartH - bh}" width="${barW}" height="${bh}" rx="${barRx}" fill="url(#barGrad)"/>`;
+    if (i % labelEvery === 0 || i === n - 1) {
+      labels += `<text x="${cx}" y="${y + h - 18}" font-size="10" fill="#71717a" text-anchor="middle">${d.label}</text>`;
+    }
   });
   return `
   <g>
@@ -241,7 +248,7 @@ function heatPanel(x, y) {
 const now = new Date(Date.now() + TZ_OFFSET_H * 3600_000);
 const stamp = `${now.getUTCFullYear()}/${String(now.getUTCMonth() + 1).padStart(2, '0')}/${String(now.getUTCDate()).padStart(2, '0')} ${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}`;
 
-const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Vibe Usage 7-day dashboard: ${esc(fmtTok(cur.total))} tokens, $${cur.cost.toFixed(2)}, ${esc(fmtHrs(cur.active))} active">
+const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Vibe Usage ${WINDOW}-day dashboard: ${esc(fmtTok(cur.total))} tokens, $${cur.cost.toFixed(2)}, ${esc(fmtHrs(cur.active))} active">
   <defs>
     <linearGradient id="barGrad" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#d4d4d8"/>
