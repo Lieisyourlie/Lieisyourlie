@@ -23,6 +23,19 @@ const res = await fetch(`https://vibecafe.ai/api/usage?days=${WINDOW * 2}`, {
 if (!res.ok) throw new Error(`HTTP ${res.status}`);
 const { buckets = [], sessions = [] } = await res.json();
 
+// Fail loudly on an unexpected payload: a silently-missing field is what made the
+// heatmap render 168 empty cells for weeks instead of breaking the workflow.
+if (!buckets.length || !sessions.length) {
+  throw new Error(`Empty payload: ${buckets.length} buckets, ${sessions.length} sessions`);
+}
+for (const [name, sample, keys] of [
+  ['bucket', buckets[0], ['bucketStart', 'inputTokens', 'outputTokens', 'cachedInputTokens', 'totalTokens', 'estimatedCost']],
+  ['session', sessions[0], ['firstMessageAt', 'lastMessageAt', 'activeSeconds', 'durationSeconds', 'messageCount', 'userMessageCount']],
+]) {
+  const missing = keys.filter((k) => sample[k] === undefined);
+  if (missing.length) throw new Error(`/api/usage ${name} missing fields: ${missing.join(', ')}`);
+}
+
 // ---- split into current WINDOW days vs previous WINDOW days (UTC+8 calendar days) ----
 const DAY = 86400_000;
 const nowLocal = Date.now() + TZ_OFFSET_H * 3600_000;
@@ -77,19 +90,14 @@ for (const b of curB) {
   }
 }
 
-// ---- heatmap: weekday x hour from userPromptHours (arrays are UTC hours) ----
+// ---- heatmap: weekday x hour, sessions counted at their local start hour ----
+// /api/usage has no per-hour data for a 30-day range: buckets are daily whenever
+// days > 1, and sessions carry no hourly breakdown. firstMessageAt is the only
+// real sub-day timestamp, and each session contributes exactly one true point.
 const heat = Array.from({ length: 7 }, () => new Array(24).fill(0));
 for (const s of curS) {
-  const t = new Date(s.firstMessageAt);
-  const arr = Array.isArray(s.userPromptHours) ? s.userPromptHours : [];
-  for (let hUtc = 0; hUtc < 24; hUtc++) {
-    const v = +arr[hUtc] || 0;
-    if (!v) continue;
-    const shifted = hUtc + TZ_OFFSET_H;
-    const hLocal = shifted % 24;
-    const dow = (t.getUTCDay() + (shifted >= 24 ? 1 : 0)) % 7; // 0=Sun
-    heat[dow][hLocal] += v;
-  }
+  const d = new Date(localMs(s.firstMessageAt)); // shifted, so UTC getters read as local
+  heat[d.getUTCDay()][d.getUTCHours()] += 1;     // 0=Sun
 }
 const heatMax = Math.max(1, ...heat.flat());
 
@@ -221,7 +229,8 @@ function heatPanel(x, y) {
     rowLabels += `<text x="${gridX - 10}" y="${gridY + r * step + cell * 0.75}" font-size="10" fill="#71717a" text-anchor="end">${dayNames[r]}</text>`;
     for (let c = 0; c < cols; c++) {
       const v = heat[r][c];
-      const lvl = v === 0 ? 0 : Math.min(5, 1 + Math.floor(v / heatMax * 4.999));
+      // sqrt, not linear: one busy hour would otherwise flatten every other cell to level 1
+      const lvl = v === 0 ? 0 : Math.min(5, 1 + Math.floor(Math.sqrt(v / heatMax) * 4.999));
       cells += `<rect x="${gridX + c * step}" y="${gridY + r * step}" width="${cell}" height="${cell}" rx="2.5" fill="${shades[lvl]}"/>`;
     }
   }
@@ -238,9 +247,7 @@ function heatPanel(x, y) {
     <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="12" fill="#0d0d0f" stroke="#232326"/>
     <text x="${x + 18}" y="${y + 30}" font-size="13" fill="#e4e4e7">🗓 分时活跃</text>
     <rect x="${x + w - 100}" y="${y + 15}" width="84" height="22" rx="11" fill="#111113" stroke="#232326"/>
-    <rect x="${x + w - 98}" y="${y + 17}" width="34" height="18" rx="9" fill="#fafafa"/>
-    <text x="${x + w - 81}" y="${y + 30}" font-size="10" text-anchor="middle" fill="#09090b">Token</text>
-    <text x="${x + w - 48}" y="${y + 30}" font-size="10" text-anchor="middle" fill="#71717a">费用</text>
+    <text x="${x + w - 58}" y="${y + 30}" font-size="10" text-anchor="middle" fill="#a1a1aa">会话数</text>
     ${rowLabels}${cells}${colLabels}${legend}
   </g>`;
 }
@@ -268,3 +275,4 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" 
 
 writeFileSync(new URL('../vibe-usage-card.svg', import.meta.url), svg);
 console.log(`Generated: $${cur.cost.toFixed(2)} · ${fmtTok(cur.total)} · ${fmtHrs(cur.active)} · ${cur.sessions} sessions`);
+console.log(`Heatmap: ${heat.flat().filter((v) => v > 0).length}/168 cells active, peak ${heatMax} sessions/hour`);
